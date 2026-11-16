@@ -1,570 +1,202 @@
-/**
- * WhatsApp MD Bot - Main Entry Point
- */
-process.env.PUPPETEER_SKIP_DOWNLOAD = 'true';
-process.env.PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = 'true';
-process.env.PUPPETEER_CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer_cache_disabled';
-
-const { initializeTempSystem } = require('./utils/tempManager');
-const { startCleanup } = require('./utils/cleanup');
-initializeTempSystem();
-startCleanup();
-const originalConsoleLog = console.log;
-const originalConsoleError = console.error;
-const originalConsoleWarn = console.warn;
-
-const forbiddenPatternsConsole = [
-  'closing session',
-  'closing open session',
-  'sessionentry',
-  'prekey bundle',
-  'pendingprekey',
-  '_chains',
-  'registrationid',
-  'currentratchet',
-  'chainkey',
-  'ratchet',
-  'signal protocol',
-  'ephemeralkeypair',
-  'indexinfo',
-  'basekey'
-];
-
-console.log = (...args) => {
-  const message = args.map(a => typeof a === 'string' ? a : typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ').toLowerCase();
-  if (!forbiddenPatternsConsole.some(pattern => message.includes(pattern))) {
-    originalConsoleLog.apply(console, args);
-  }
-};
-
-console.error = (...args) => {
-  const message = args.map(a => typeof a === 'string' ? a : typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ').toLowerCase();
-  if (!forbiddenPatternsConsole.some(pattern => message.includes(pattern))) {
-    originalConsoleError.apply(console, args);
-  }
-};
-
-console.warn = (...args) => {
-  const message = args.map(a => typeof a === 'string' ? a : typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ').toLowerCase();
-  if (!forbiddenPatternsConsole.some(pattern => message.includes(pattern))) {
-    originalConsoleWarn.apply(console, args);
-  }
-};
-
-// Now safe to load libraries
-const pino = require('pino');
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  Browsers,
-  fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
-const config = require('./config');
-const handler = require('./handler');
-const antidelete = require('./utils/antidelete');
-const savestatus = require('./utils/savestatus');
-const autostatus = require('./utils/autostatus');
-const { rememberFromMessage, rememberContact } = require('./utils/nameCache');
-const groupStatusTracker = require('./utils/groupStatusTracker');
-const { createStatusRevoker } = require('./utils/statusRevoke');
-const fs = require('fs');
-const path = require('path');
-const zlib = require('zlib');
-const os = require('os');
-
-// Remove Puppeteer cache (if some dependency downloaded Chromium into ~/.cache/puppeteer)
-function cleanupPuppeteerCache() {
-  try {
-    const home = os.homedir();
-    const cacheDir = path.join(home, '.cache', 'puppeteer');
-
-    if (fs.existsSync(cacheDir)) {
-      console.log('🧹 Removing Puppeteer cache at:', cacheDir);
-      fs.rmSync(cacheDir, { recursive: true, force: true });
-      console.log('✅ Puppeteer cache removed');
-    }
-  } catch (err) {
-    console.error('⚠️ Failed to cleanup Puppeteer cache:', err.message || err);
-  }
-}
-// Optimized in-memory store with hard limits (Map-based for better memory management)
-const store = {
-  messages: new Map(), // Use Map instead of plain object
-  byId: new Map(),
-  maxPerChat: 20, // Limit to 20 messages per chat
-  maxById: 300,
-
-  bind: (ev) => {
-    ev.on('messages.upsert', ({ messages }) => {
-      for (const msg of messages) {
-        if (!msg.key?.id) continue;
-        rememberFromMessage(msg);
-        groupStatusTracker.recordFromMessage(msg);
-
-        const jid = msg.key.remoteJid;
-        if (!store.messages.has(jid)) {
-          store.messages.set(jid, new Map());
-        }
-
-        const chatMsgs = store.messages.get(jid);
-        chatMsgs.set(msg.key.id, msg);
-        store.byId.set(msg.key.id, msg);
-
-        // Aggressive cleanup per chat - keep only recent messages
-        if (chatMsgs.size > store.maxPerChat) {
-          // Remove oldest message (first entry in Map)
-          const oldestKey = chatMsgs.keys().next().value;
-          chatMsgs.delete(oldestKey);
-        }
-        if (store.byId.size > store.maxById) {
-          const oldestId = store.byId.keys().next().value;
-          store.byId.delete(oldestId);
-        }
-      }
-    });
-    ev.on('contacts.upsert', (contacts) => {
-      for (const contact of contacts || []) rememberContact(contact);
-    });
-    ev.on('contacts.update', (contacts) => {
-      for (const contact of contacts || []) rememberContact(contact);
-    });
-    ev.on('messaging-history.set', ({ contacts, messages }) => {
-      for (const contact of contacts || []) rememberContact(contact);
-      for (const msg of messages || []) {
-        rememberFromMessage(msg);
-        groupStatusTracker.recordFromMessage(msg);
-      }
-    });
-  },
-
-  loadMessage: async (jid, id) => {
-    return store.messages.get(jid)?.get(id) || store.byId.get(id) || null;
-  }
-};
-
-// Optimized message deduplication (Set-based, no timestamps needed)
-const processedMessages = new Set();
-
-// Aggressive cleanup - clear every 5 minutes
-setInterval(() => {
-  processedMessages.clear();
-}, 5 * 60 * 1000); // Every 5 minutes
-
-// Custom Pino logger with suppression for Baileys noise
-const createSuppressedLogger = (level = 'silent') => {
-  const forbiddenPatterns = [
-    'closing session',
-    'closing open session',
-    'sessionentry',
-    'prekey bundle',
-    'pendingprekey',
-    '_chains',
-    'registrationid',
-    'currentratchet',
-    'chainkey',
-    'ratchet',
-    'signal protocol',
-    'ephemeralkeypair',
-    'indexinfo',
-    'basekey',
-    'sessionentry',
-    'ratchetkey'
-  ];
-
-  let logger;
-  try {
-    logger = pino({
-      level,
-      // Fallback transport without pino-pretty (in case not installed)
-      transport: process.env.NODE_ENV === 'production' ? undefined : {
-        target: 'pino-pretty',
-        options: {
-          colorize: true,
-          ignore: 'pid,hostname'
-        }
-      },
-      customLevels: {
-        trace: 0,
-        debug: 1,
-        info: 2,
-        warn: 3,
-        error: 4,
-        fatal: 5
-      },
-      // Redact sensitive fields
-      redact: ['registrationId', 'ephemeralKeyPair', 'rootKey', 'chainKey', 'baseKey']
-    });
-  } catch (err) {
-    // Fallback to basic pino without transport
-    logger = pino({ level });
-  }
-
-  // Wrap log methods to filter
-  const originalInfo = logger.info.bind(logger);
-  logger.info = (...args) => {
-    const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ').toLowerCase();
-    if (!forbiddenPatterns.some(pattern => msg.includes(pattern))) {
-      originalInfo(...args);
-    }
-  };
-  logger.debug = () => { }; // Fully disable debug
-  logger.trace = () => { }; // Fully disable trace
-  return logger;
-};
-
-// Main connection function
-async function startBot() {
-  const sessionFolder = `./${config.sessionName}`;
-  const sessionFile = path.join(sessionFolder, 'creds.json');
-
-  // Check if sessionID is provided and process KnightBot! format session
-  if (config.sessionID && config.sessionID.startsWith('KnightBot!')) {
-    try {
-      const [header, b64data] = config.sessionID.split('!');
-
-      if (header !== 'KnightBot' || !b64data) {
-        throw new Error("❌ Invalid session format. Expected 'KnightBot!.....'");
-      }
-
-      const cleanB64 = b64data.replace('...', '');
-      const compressedData = Buffer.from(cleanB64, 'base64');
-      const decompressedData = zlib.gunzipSync(compressedData);
-
-      // Ensure session folder exists
-      if (!fs.existsSync(sessionFolder)) {
-        fs.mkdirSync(sessionFolder, { recursive: true });
-      }
-
-      // Write decompressed session data to creds.json
-      fs.writeFileSync(sessionFile, decompressedData, 'utf8');
-      console.log('📡 Session : 🔑 Retrieved from KnightBot Session');
-
-    } catch (e) {
-      console.error('📡 Session : ❌ Error processing KnightBot session:', e.message);
-      // Continue with normal QR flow if session processing fails
-    }
-  }
-
-  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-  const { version } = await fetchLatestBaileysVersion();
-
-  // Use suppressed logger for socket
-  const suppressedLogger = createSuppressedLogger('silent');
-
-  const sock = makeWASocket({
-    version, // explicit WA Web version negotiated with the server
-    logger: suppressedLogger,
-    printQRInTerminal: false,
-    // Use a common desktop browser signature
-    browser: ['Chrome', 'Windows', '10.0'],
-    auth: state,
-    // Memory optimization: prevent loading old messages into RAM
-    syncFullHistory: false,
-    downloadHistory: false,
-    markOnlineOnConnect: false,
-    getMessage: async () => undefined, // Don't load messages from store
-    cachedGroupMetadata: async (jid) => handler.peekGroupMetadata(jid),
-    useCachedGroupMetadata: true,
-  });
-
-  sock.rawGroupMetadata = sock.groupMetadata.bind(sock);
-  sock.revokeGroupStatus = createStatusRevoker(sock);
-
-  // Bind store to socket
-  store.bind(sock.ev);
-  sock.store = store;
-
-  // Watchdog for inactive socket (Baileys bug fix)
-  let lastActivity = Date.now();
-  const INACTIVITY_TIMEOUT = 30 * 60 * 1000; // 30 minutes
-
-  // Update on every message
-  sock.ev.on('messages.upsert', () => {
-    lastActivity = Date.now();
-  });
-
-  // Check every 5 min
-  const watchdogInterval = setInterval(async () => {
-    if (Date.now() - lastActivity > INACTIVITY_TIMEOUT && sock.ws.readyState === 1) { // WebSocket open but inactive
-      console.log('⚠️ No activity detected. Forcing reconnect...');
-      await sock.end(undefined, undefined, { reason: 'inactive' });
-      clearInterval(watchdogInterval);
-      setTimeout(() => startBot(), 5000); // Slightly longer delay
-    }
-  }, 5 * 60 * 1000); // Every 5 min check
-
-  // Clear on close/open
-  sock.ev.on('connection.update', (update) => {
-    const { connection } = update;
-    if (connection === 'open') {
-      lastActivity = Date.now(); // Reset on open
-      sock.groupAlertsReadyAt = Date.now() + 15000;
-    } else if (connection === 'close') {
-      clearInterval(watchdogInterval);
-    }
-  });
-
-  // Connection update handler
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log('\n\n📱 Scan this QR code with WhatsApp:\n');
-      qrcode.generate(qr, { small: true });
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
-
-      // Suppress verbose error output for common stream / gateway errors
-      if (statusCode === 515 || statusCode === 503 || statusCode === 502 || statusCode === 504 || statusCode === 408) {
-        console.log(`⚠️ Connection closed (${statusCode}). Reconnecting...`);
-      } else {
-        console.log('Connection closed due to:', errorMessage, '\nReconnecting:', shouldReconnect);
-      }
-
-      if (shouldReconnect) {
-        setTimeout(() => startBot(), 3000);
-      }
-    } else if (connection === 'open') {
-      console.log('\n✅ Bot connected successfully!');
-      console.log(`📱 Bot Number: ${sock.user.id.split(':')[0]}`);
-      console.log(`🤖 Bot Name: ${config.botName}`);
-      console.log(`⚡ Prefix: ${config.prefix}`);
-      const ownerNames = Array.isArray(config.ownerName) ? config.ownerName.join(',') : config.ownerName;
-      console.log(`👑 Owner: ${ownerNames}\n`);
-      console.log('Bot is ready to receive messages!\n');
-      sock.groupAlertsReadyAt = Date.now() + 15000;
-
-      // Set bot status
-      if (config.autoBio) {
-        await sock.updateProfileStatus(`${config.botName} | Active 24/7`);
-      }
-
-      // Initialize anti-call feature
-      handler.initializeAntiCall(sock);
-
-      // Cleanup old chats (keep only active ones, e.g., last touched <1 day)
-      const now = Date.now();
-      for (const [jid, chatMsgs] of store.messages.entries()) {
-        const timestamps = Array.from(chatMsgs.values()).map(m => m.messageTimestamp * 1000 || 0);
-        if (timestamps.length > 0 && now - Math.max(...timestamps) > 24 * 60 * 60 * 1000) { // 1 day old chat
-          store.messages.delete(jid);
-        }
-      }
-      console.log(`🧹 Store cleaned. Active chats: ${store.messages.size}`);
-    }
-  });
-
-  // Credentials update handler
-  sock.ev.on('creds.update', saveCreds);
-
-  // System JID filter - checks if JID is from broadcast/status/newsletter
-  const isSystemJid = (jid) => {
-    if (!jid) return true;
-    return jid.includes('@broadcast') ||
-      jid.includes('status.broadcast') ||
-      jid.includes('@newsletter') ||
-      jid.includes('@newsletter.');
-  };
-
-  // Messages handler - Process only new messages
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
-    // Process messages in the array
-    for (const msg of messages) {
-      // Skip if message is invalid or missing key
-      if (!msg.message || !msg.key?.id) continue;
-
-      const from = msg.key.remoteJid;
-      if (!from) {
-        continue;
-      }
-
-      // Status can arrive as "append". Save it before the notify-only filter.
-      if (from === 'status@broadcast' || from.includes('status@broadcast')) {
-        if (!processedMessages.has(msg.key.id)) {
-          processedMessages.add(msg.key.id);
-          savestatus.autoSave(sock, msg).catch(err => {
-            console.error('[savestatus]', err.message);
-          });
-          if (type === 'notify') {
-            autostatus.reactToStatus(sock, msg.key).catch(err => {
-              console.error('[autostatus] react:', err.message);
-            });
-          }
-        }
-        continue;
-      }
-
-      // Only process "notify" type (new messages), skip "append" (old messages from history)
-      if (type !== 'notify') continue;
-
-      // System message filter - ignore broadcast/newsletter messages
-      if (isSystemJid(from)) {
-        continue; // Silently ignore system messages
-      }
-
-      // Deduplication: Skip if message has already been processed
-      const msgId = msg.key.id;
-      if (processedMessages.has(msgId)) continue;
-
-      // Timestamp validation: Only process messages within last 5 minutes
-      const MESSAGE_AGE_LIMIT = 5 * 60 * 1000; // 5 minutes in milliseconds
-      let messageAge = 0;
-      if (msg.messageTimestamp) {
-        messageAge = Date.now() - (msg.messageTimestamp * 1000);
-        if (messageAge > MESSAGE_AGE_LIMIT) {
-          // Message is too old, skip processing
-          continue;
-        }
-      }
-
-      // Mark message as processed
-      processedMessages.add(msgId);
-
-      // Store message FIRST (before processing)
-      // from already defined above in DM block check
-      if (msg.key && msg.key.id) {
-        if (!store.messages.has(from)) {
-          store.messages.set(from, new Map());
-        }
-        const chatMsgs = store.messages.get(from);
-        chatMsgs.set(msg.key.id, msg);
-
-        // Cleanup: Keep only last 20 per chat (reduced from 200)
-        if (chatMsgs.size > store.maxPerChat) {
-          // Remove oldest messages
-          const sortedIds = Array.from(chatMsgs.entries())
-            .sort((a, b) => (a[1].messageTimestamp || 0) - (b[1].messageTimestamp || 0))
-            .map(([id]) => id);
-          for (let i = 0; i < sortedIds.length - store.maxPerChat; i++) {
-            chatMsgs.delete(sortedIds[i]);
-          }
-        }
-      }
-
-      antidelete.onMessage(sock, msg).catch(err => {
-        console.error('[antidelete]', err.message);
-      });
-
-      // Process command IMMEDIATELY (don't block on other operations)
-      handler.handleMessage(sock, msg).catch(err => {
-        if (!err.message?.includes('rate-overlimit') &&
-          !err.message?.includes('not-authorized')) {
-          console.error('Error handling message:', err.message);
-        }
-      });
-
-      // Do other operations in background (non-blocking)
-      setImmediate(async () => {
-        if (config.autoRead && from.endsWith('@g.us')) {
-          try {
-            await sock.readMessages([msg.key]);
-          } catch (e) {
-            // Silently handle
-          }
-        }
-        if (from.endsWith('@g.us')) {
-          try {
-            const groupMetadata = await handler.getGroupMetadata(sock, msg.key.remoteJid);
-            if (groupMetadata) {
-              await handler.handleAntilink(sock, msg, groupMetadata);
-            }
-          } catch (error) {
-            // Silently handle
-          }
-        }
-      });
-    }
-  });
-
-  // Message receipt updates (silently handled, no logging)
-  sock.ev.on('message-receipt.update', () => {
-    // Silently handle receipt updates
-  });
-
-  sock.ev.on('messages.update', (updates) => {
-    antidelete.onUpdates(sock, updates).catch(err => {
-      console.error('[antidelete]', err.message);
-    });
-  });
-
-  // Group participant updates (join/leave)
-  sock.ev.on('group-participants.update', async (update) => {
-    if (!sock.ws?.isOpen) return;
-    if (sock.groupAlertsReadyAt && Date.now() < sock.groupAlertsReadyAt) return;
-    await handler.handleGroupUpdate(sock, update);
-  });
-
-  // Handle errors - suppress common stream / gateway blips
-  sock.ev.on('error', (error) => {
-    if (isTransientNetworkError(error)) return;
-    console.error('Socket error:', error.message || error);
-  });
-
-  return sock;
-}
-// Start the bot
-console.log('🚀 Starting WhatsApp MD Bot...\n');
-console.log(`📦 Bot Name: ${config.botName}`);
-console.log(`⚡ Prefix: ${config.prefix}`);
-const ownerNames = Array.isArray(config.ownerName) ? config.ownerName.join(',') : config.ownerName;
-console.log(`👑 Owner: ${ownerNames}\n`);
-
-// Proactively delete Puppeteer cache so it doesn't fill disk on panels
-cleanupPuppeteerCache();
-
-startBot().catch(err => {
-  console.error('Error starting bot:', err);
-  process.exit(1);
-});
-/** Transient WA / network blips — reconnect handles these; don't dump stacks. */
-function isTransientNetworkError(err) {
-  if (!err) return false;
-  const msg = String(err.message || err);
-  const code = err.code || err.response?.statusCode || err.output?.statusCode;
-  if (
-    code === 408 || code === 502 || code === 503 || code === 504 ||
-    code === 515 || code === 'ETIMEDOUT' || code === 'ECONNRESET' ||
-    code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EAI_AGAIN' ||
-    code === 'ERR_NON_2XX_3XX_RESPONSE'
-  ) {
-    return true;
-  }
-  return /Gateway Time-out|gateway timeout|timed?\s*out|socket hang up|ECONNRESET|ETIMEDOUT|ENOTFOUND|fetch failed|Connection Closed|Stream Errored/i.test(msg);
-}
-
-function briefErr(err) {
-  if (!err) return 'unknown';
-  const code = err.code || err.response?.statusCode || err.output?.statusCode || '';
-  const msg = err.message || String(err);
-  return code ? `${code}: ${msg}` : msg;
-}
-
-// Handle process termination
-process.on('uncaughtException', (err) => {
-  // Handle ENOSPC errors gracefully without crashing
-  if (err.code === 'ENOSPC' || err.errno === -28 || err.message?.includes('no space left on device')) {
-    console.error('⚠️ ENOSPC Error: No space left on device. Attempting cleanup...');
-    const { cleanupOldFiles } = require('./utils/cleanup');
-    cleanupOldFiles();
-    console.warn('⚠️ Cleanup completed. Bot will continue but may experience issues until space is freed.');
-    return; // Don't crash, just log and continue
-  }
-  if (isTransientNetworkError(err)) {
-    console.warn(`⚠️ Transient error (ignored): ${briefErr(err)}`);
-    return;
-  }
-  console.error('Uncaught Exception:', err);
-});
-process.on('unhandledRejection', (err) => {
-  // Handle ENOSPC errors gracefully
-  if (err?.code === 'ENOSPC' || err?.errno === -28 || err?.message?.includes('no space left on device')) {
-    console.warn('⚠️ ENOSPC Error in promise: No space left on device. Attempting cleanup...');
-    const { cleanupOldFiles } = require('./utils/cleanup');
-    cleanupOldFiles();
-    console.warn('⚠️ Cleanup completed. Bot will continue but may experience
+<div align="center">
+
+## BLack-MD
+
+[![Made with Baileys](https://img.shields.io/badge/Made%20with-Baileys-00bcd4?style=for-the-badge)](https://github.com/WhiskeySockets/Baileys)
+[![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
+
+<img src="utils/bot_image.jpg" alt="Knight Bot" width="260">
+
+</div>
+
+BLack-MD is a WhatsApp MD bot built on top of the **Baileys** library.  
+It’s designed to be fast, lightweight, and easy to customize without touching the core code.  
+This project is **fully open source** — you can modify it, rebrand it, and make your **own bot** from this codebase **free of cost**, without needing any permission from our side.  
+All commands and the overall structure are written in a way that makes customization (bot image, prefix, name, features, etc.) as easy as possible.
+
+---
+
+
+## ✨ Features
+
+- **Fully Open Source** – entire codebase is editable; host it anywhere (Heroku, panel, VPS, etc.).  
+- **Easy Customization via Commands** – change **bot image**, **prefix**, **channel/newsletter**, **bot name**, etc. with simple commands.  
+- **Modular Command System** – commands are organized in the `commands` folder for easy editing.  
+- **Optimized for Stability** – RAM‑optimized media handling (streaming, temp cleanup), better session handling via `sessionID` in `config.js`.  
+- **Owner Utilities** – restart, update from ZIP, and more owner‑only tools.
+
+---
+
+### 1. Fork the Repository
+
+<div align="center">
+
+<a href="https://github.com/mruniquehacker/Knightbot-MD/fork" target="_blank">
+  <img src="https://img.shields.io/badge/Fork%20Repository-GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="Fork on GitHub">
+</a>
+
+</div>
+
+> This creates your own copy of `Knightbot-MD` under your GitHub account.
+
+---
+
+### 2. Get Pair Code
+
+Deploy a small helper to generate a **pair code** and obtain your session string.
+
+<div align="center">
+
+<a href="https://knight-bot-paircode.onrender.com/" target="_blank">
+  <img src="https://img.shields.io/badge/Generate-Pair%20Code-blueviolet?style=for-the-badge" alt="Generate Pair Code">
+</a>
+
+</div>
+
+After scanning, you will receive a **session string** starting with:
+
+```text
+KnightBot!H4....
+```
+
+Copy that full string and paste it into `config.js`:
+
+```js
+sessionID: 'KnightBot!H4.....'
+```
+
+Or set it via the `SESSION_ID` environment variable when hosting.
+
+---
+
+### 3. Deploy on Panel (Katabump, etc.)
+
+<div align="center">
+
+<a href="https://dashboard.katabump.com/auth/login#d6b7d6" target="_blank">
+  <img src="https://img.shields.io/badge/Deploy%20on-Katabump-orange?style=for-the-badge" alt="Deploy on Katabump">
+</a>
+
+</div>
+
+For a full step‑by‑step deployment tutorial (panels / VPS / Heroku), add or update your YouTube guide here:
+
+- **YouTube Tutorial:** *(coming soon)*
+
+---
+
+## 🛠 Local Setup
+
+### 1️⃣ Clone the repository
+
+```bash
+git clone https://github.com/mruniquehacker/Knightbot-MD.git
+cd Knightbot-MD
+```
+
+### 2️⃣ Install dependencies
+
+```bash
+npm install
+```
+
+### 3️⃣ Configure session
+
+Edit `config.js`:
+
+- **Option A: Use session string**
+
+  ```js
+  sessionID: 'KnightBot!H4.....'
+  ```
+
+- **Option B: Scan QR**
+
+  ```js
+  sessionID: ''
+  ```
+
+  Run the bot and scan the QR from the terminal.
+
+### 4️⃣ Run the bot
+
+```bash
+node index.js
+```
+
+When the bot starts:
+
+- If `sessionID` is empty, a **QR code** will appear in the terminal – scan it using **Linked Devices** in WhatsApp.  
+- If `sessionID` is set, it will log in using that session string.
+
+---
+
+## 🌐 Community
+
+<div align="center">
+
+<a href="https://t.me/+3QhFUZHx-nhhZmY1" target="_blank">
+  <img src="https://img.shields.io/badge/Join-Telegram-0088cc?style=for-the-badge&logo=telegram&logoColor=white" alt="Join Telegram">
+</a>
+
+<a href="https://whatsapp.com/channel/0029Va90zAnIHphOuO8Msp3A" target="_blank">
+  <img src="https://img.shields.io/badge/Join-WhatsApp-25D366?style=for-the-badge&logo=whatsapp&logoColor=white" alt="Join WhatsApp Channel">
+</a>
+
+</div>
+
+---
+
+## 🙏 Credits
+
+- **Mr Unique Hacker** – Main developer & maintainer  
+- **Baileys** – WhatsApp Web API library (`@whiskeysockets/baileys`)  
+- Other open‑source libraries listed in `package.json`
+
+---
+
+## ⚠️ Important Warning
+
+- This bot is created **for educational purposes only**.  
+- This is **NOT** an official WhatsApp bot.  
+- Using third‑party bots **may violate WhatsApp’s Terms of Service** and can lead to your account being **banned**.
+
+> You use this bot **at your own risk**.  
+> The developers are **not responsible** for any bans, issues, or damages resulting from its use.
+
+---
+
+## 📝 Legal
+
+- This project is **not affiliated with, authorized, maintained, sponsored, or endorsed** by WhatsApp Inc. or any of its affiliates or subsidiaries.  
+- This is **independent and unofficial software**.  
+- **Do not spam** people using this bot.  
+- **Do not** use this bot for bulk messaging, harassment, or any **illegal activities**.  
+- The developers assume **no liability** and are **not responsible** for any misuse or damage caused by this program.
+
+---
+
+## 📄 License (MIT)
+
+This project is licensed under the **MIT License**.
+
+You must:
+
+- Use this software in compliance with **all applicable laws and regulations**.  
+- Keep the **original license and copyright** notices.  
+- **Credit the original authors**.  
+- **Not** use this for spam, abuse, or malicious purposes.
+
+---
+
+## 📜 Copyright Notice
+
+Copyright (c) **2026 Professor**.  
+All rights reserved.
+
+This project contains code from various open‑source projects and AI tools, including but not limited to:
+
+- **Baileys** – MIT License  
+- Other libraries as listed in `package.json`
+
