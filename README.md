@@ -6,9 +6,6 @@
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 
-<img src="utils/bot_image.jpg" alt="Knight Bot" width="260">
-
-</div>
 
 BLack-MD is a WhatsApp MD bot built on top of the **Baileys** library.  
 It’s designed to be fast, lightweight, and easy to customize without touching the core code.  
@@ -19,7 +16,6 @@ All commands and the overall structure are written in a way that makes customiza
 
 ## 🧑‍💻 Developer
 
-<div align="center">
 
 <a href="https://t.me/+3QhFUZHx-nhhZmY1" target="_blank">
   <img src="https://img.shields.io/badge/Join-Telegram-0088cc?style=for-the-badge&logo=telegram&logoColor=white" alt="Join Telegram">
